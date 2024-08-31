@@ -14,17 +14,30 @@ use std::rc::Rc;
 
 use allocative::Allocative;
 use anyhow::Context;
+use buck2_build_api::actions::impls::json::is_singleton_cmdargs;
+use buck2_build_api::actions::impls::json::with_command_line_context;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::bxl::build_result::BxlBuildResult;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsArtifactLike;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact_tagging::TaggedValue;
+use buck2_build_api::interpreter::rule_defs::cmd_args::value::CommandLineArg;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use buck2_build_api::interpreter::rule_defs::cmd_args::StarlarkCommandLineInputs;
+use buck2_build_api::interpreter::rule_defs::provider::ValueAsProviderLike;
+use buck2_build_api::interpreter::rule_defs::transitive_set::TransitiveSetJsonProjection;
+use buck2_core::execution_types::executor_config::PathSeparatorKind;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
+use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::path::artifact_path::ArtifactPath;
 use buck2_interpreter::error::BuckStarlarkError;
+use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
+use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use derivative::Derivative;
 use derive_more::Display;
 use dupe::Dupe;
@@ -42,6 +55,7 @@ use starlark::starlark_module;
 use starlark::values::dict::Dict;
 use starlark::values::dict::DictRef;
 use starlark::values::dict::UnpackDictEntries;
+use starlark::values::enumeration::EnumValue;
 use starlark::values::list::ListRef;
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
@@ -59,6 +73,7 @@ use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueLike;
+use starlark::values::ValueTypedComplex;
 use starlark::StarlarkDocs;
 use starlark::StarlarkResultExt;
 
@@ -222,8 +237,10 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
         Ok(NoneType)
     }
 
-    /// Outputs results to the console via stdout as pretty-printed json. Pretty
-    /// printing can be turned off by the `pretty` keyword-only parameter.
+    /// Outputs results to the console via stdout as pretty-printed json. Pretty printing can be
+    /// turned off by the `pretty` keyword-only parameter. Paths can be rendered as absolute by the
+    /// `absolute` keyword-only parameter.
+    ///
     /// These outputs are considered to be the results of a bxl script, which will be displayed to
     /// stdout by buck2 even when the script is cached.
     ///
@@ -241,10 +258,12 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
         this: &'v OutputStream<'v>,
         value: Value<'v>,
         #[starlark(require=named, default=true)] pretty: bool,
+        #[starlark(require=named, default=false)] absolute: bool,
     ) -> anyhow::Result<NoneType> {
         /// A wrapper with a Serialize instance so we can pass down the necessary context.
         struct SerializeValue<'a, 'v, 'd> {
             value: Value<'v>,
+            absolute: bool,
             artifact_fs: &'a ArtifactFs,
             project_fs: &'a ProjectRoot,
             async_ctx: &'a Rc<RefCell<dyn BxlDiceComputations + 'd>>,
@@ -254,6 +273,7 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
             fn with_value(&self, x: Value<'v>) -> Self {
                 Self {
                     value: x,
+                    absolute: self.absolute,
                     artifact_fs: self.artifact_fs,
                     project_fs: self.project_fs,
                     async_ctx: self.async_ctx,
@@ -261,11 +281,13 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
             }
         }
 
-        impl Serialize for SerializeValue<'_, '_, '_> {
+        impl<'v> Serialize for SerializeValue<'_, 'v, '_> {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: Serializer,
             {
+                let executor_fs =
+                    ExecutorFs::new(self.artifact_fs, PathSeparatorKind::system_default());
                 if let Some(ensured) = <&EnsuredArtifact>::unpack_value(self.value)
                     .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
                 {
@@ -305,6 +327,22 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
                         })
                         .map_err(|err| serde::ser::Error::custom(format!("{:#}", err)))?;
                     seq_ser.end()
+                } else if let Some(_) = NoneType::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
+                    serializer.serialize_none()
+                } else if let Some(x) = <&'v str>::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
+                    serializer.serialize_str(x)
+                } else if let Some(x) = i64::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
+                    serializer.serialize_i64(x)
+                } else if let Some(x) = bool::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
+                    serializer.serialize_bool(x)
                 } else if let Some(x) = ListRef::from_value(self.value) {
                     serializer.collect_seq(x.iter().map(|v| self.with_value(v)))
                 } else if let Some(x) = TupleRef::from_value(self.value) {
@@ -318,6 +356,52 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
                     serializer.collect_map(x.iter().map(|(k, v)| (k, self.with_value(v))))
                 } else if let Some(x) = Record::from_value(self.value) {
                     serializer.collect_map(x.iter().map(|(k, v)| (k, self.with_value(v))))
+                } else if let Some(x) = EnumValue::from_value(self.value) {
+                    x.serialize(serializer)
+                } else if let Some(x) = ValueAsArtifactLike::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
+                    let path =
+                        x.0.get_bound_artifact()
+                            .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                            .resolve_path(self.artifact_fs)
+                            .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?;
+                    let path = with_command_line_context(&executor_fs, self.absolute, |ctx| {
+                        ctx.resolve_project_path(path).map(|loc| loc.into_string())
+                    })
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?;
+                    serializer.serialize_str(&path)
+                } else if let Some(x) = ValueAsProviderLike::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
+                    serializer
+                        .collect_map(x.0.items().iter().map(|(k, v)| (k, self.with_value(*v))))
+                } else if let Some(x) = StarlarkConfiguredProvidersLabel::from_value(self.value) {
+                    x.serialize(serializer)
+                } else if let Some(x) = TaggedValue::from_value(self.value) {
+                    self.with_value(*x.value()).serialize(serializer)
+                } else if let Some(x) = StarlarkTargetLabel::from_value(self.value) {
+                    x.serialize(serializer)
+                } else if let Some(x) = CommandLineArg::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
+                    // WriteJsonCommandLineArgGen assumes that any args/write-to-file macros are
+                    // rejected here and needs to be updated if that changes.
+                    let mut items = Vec::<String>::new();
+
+                    with_command_line_context(&executor_fs, self.absolute, |ctx| {
+                        x.as_command_line_arg().add_to_command_line(&mut items, ctx)
+                    })
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?;
+
+                    // We change the type, based on the value - singleton = String, otherwise list.
+                    // That's a little annoying (type based on value), but otherwise there would be
+                    // no way to produce a cmd_args as a single string.
+                    if is_singleton_cmdargs(x) {
+                        serializer.serialize_str(&items.concat())
+                    } else {
+                        serializer.collect_seq(items)
+                    }
                 } else {
                     self.value.serialize(serializer)
                 }
@@ -333,6 +417,7 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
             this.sink.borrow_mut().deref_mut(),
             &SerializeValue {
                 value,
+                absolute,
                 artifact_fs: &this.artifact_fs,
                 project_fs: &this.project_fs,
                 async_ctx: &this.async_ctx,

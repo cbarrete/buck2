@@ -92,7 +92,7 @@ fn err<R, E: serde::ser::Error>(res: anyhow::Result<R>) -> Result<R, E> {
     }
 }
 
-fn with_command_line_context<F, T>(fs: &ExecutorFs<'_>, absolute: bool, f: F) -> T
+pub fn with_command_line_context<F, T>(fs: &ExecutorFs<'_>, absolute: bool, f: F) -> T
 where
     F: FnOnce(&mut dyn CommandLineContext) -> T,
 {
@@ -245,7 +245,7 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
     }
 }
 
-fn is_singleton_cmdargs(x: CommandLineArg) -> bool {
+pub fn is_singleton_cmdargs(x: CommandLineArg) -> bool {
     if let Some(x) = x.to_value().downcast_ref::<StarlarkCmdArgs>() {
         x.is_concat()
     } else if let Some(x) = x.to_value().downcast_ref::<FrozenStarlarkCmdArgs>() {
